@@ -37,12 +37,16 @@ git push -u origin main
 | Secret 名 | 用途 | 怎么拿 |
 |---|---|---|
 | `SERVERCHAN_KEY` | 推到微信 | 到 sct.ftqq.com 微信扫码登录，复制 SendKey |
+| `FEISHU_WEBHOOK` | 推到飞书群 | 飞书群 → 设置 → 群机器人 → 添加机器人 → 自定义机器人 → 复制 Webhook 地址 |
+| `FEISHU_SECRET` | 可选，飞书加签密钥 | 添加机器人时若勾选了「签名校验」，把密钥填这里；没勾选就不用填 |
 | `NTFY_TOPIC` | 推到 ntfy App | 手机装 ntfy，订阅一个自定义主题名（这个名字就是密钥） |
 | `DINGTALK_WEBHOOK` | 推到钉钉群 | 建一个只有自己的群 → 群设置 → 智能群助手 → 添加「自定义机器人」→ 复制 Webhook 地址 |
 
-推荐 **Server酱**：不用装 App，消息直接进微信。
+推荐 **飞书**或 **Server酱**。飞书的机器人卡片渲染最好（标题 + 加粗 + 可点击链接）；
+Server酱 不用装 App，消息直接进微信。
 
 > Telegram 不可用——实测 `api.telegram.org` 从你的网络连不上（返回 000）。
+> ntfy 通道已做过真实的端到端投递验证，中文标题和 Markdown 链接都能正常送达。
 
 ### 3. 测试
 

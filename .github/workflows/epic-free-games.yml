@@ -23,8 +23,10 @@ jobs:
 
       - name: 检查免费游戏并推送通知
         env:
-          # 只配一个即可，配几个就发几个渠道
+          # 配一个即可，配几个就发几个渠道
           SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
         run: python3 scripts/epic_free_games.py
