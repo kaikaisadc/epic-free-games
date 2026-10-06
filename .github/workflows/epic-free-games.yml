@@ -1,0 +1,41 @@
+name: Epic 免费游戏提醒
+
+# 触发方式：
+#   schedule        —— 每周四 23:17 UTC（北京时间周五 07:17），Epic 在周四 15:00 UTC 轮换
+#                      注意：GitHub 免费账号的【私有仓库】不会触发 schedule，需改用
+#                      workflow_dispatch + 外部定时器，或把仓库设为公开。见 README。
+#   workflow_dispatch —— 手动点击运行，也可被外部定时器（cron-job.org 等）调用
+on:
+  schedule:
+    - cron: "17 23 * * 4"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write # 保活步骤需要，用于重置 60 天无活动计时
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 检查免费游戏并推送通知
+        env:
+          # 只配一个即可，配几个就发几个渠道
+          SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+        run: python3 scripts/epic_free_games.py
+
+      - name: 保活（避免 60 天无活动被 GitHub 自动禁用定时任务）
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -sS -X PUT \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/epic-free-games.yml/enable" \
+            || echo "保活调用失败，不影响本次通知"
