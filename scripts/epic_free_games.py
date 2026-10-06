@@ -48,9 +48,15 @@ def http_post(url: str, data: bytes, headers: dict, timeout: int = 30):
 
 def checkout_link(namespace: str, offer_id: str) -> str:
     """生成 Epic 官方预填结账链接：点开后确认即可完成领取。"""
+    return checkout_link_all([(namespace, offer_id)])
+
+
+def checkout_link_all(offers: list) -> str:
+    """把多个 (namespace, offer_id) 合成一条结账链接，一次领完。"""
+    offers_param = "".join(f"&offers=1-{ns}-{oid}" for ns, oid in offers)
     checkout = (
         f"{PURCHASE_ENDPOINT}?highlightColor=0078f2"
-        f"&offers=1-{namespace}-{offer_id}&orderId&purchaseToken&showNavigation=true"
+        f"{offers_param}&orderId&purchaseToken&showNavigation=true"
     )
     query = urllib.parse.urlencode(
         {"noHostRedirect": "true", "redirectUrl": checkout, "client_id": WEB_CLIENT_ID}
@@ -108,6 +114,13 @@ def build_report() -> tuple:
             upcoming.append((element, info["window"]))
 
     lines = ["**本周可以白领的游戏**", ""]
+    if active:
+        combined = checkout_link_all(
+            [(e["namespace"], e["id"]) for e, _ in active]
+        )
+        if len(active) > 1:
+            lines.append(f"**[一键领取全部 {len(active)} 个]({combined})**")
+            lines.append("")
     for element, window in active:
         link = checkout_link(element["namespace"], element["id"])
         lines.append(f"**{element['title']}**（{window['end'][:10]} 截止）")
