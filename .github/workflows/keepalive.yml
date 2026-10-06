@@ -1,0 +1,38 @@
+name: 仓库保活
+
+# 为什么需要这个：
+#   GitHub 会在【仓库连续 60 天没有任何提交活动】后，自动禁用仓库里的定时任务（schedule），
+#   公开仓库和私有仓库都一样。社区实测下来，唯一【确定】能重置这个计时器的活动就是
+#   提交/推送——发 release、打 tag、开 issue、提 PR 都不算，workflow 自身的运行也不算。
+#   所以最保险的保活方式就是定期让仓库产生一个提交，空提交即可。
+#
+#   另注：epic-free-games.yml 里那个调用 enable 接口的「保活」步骤据社区反馈也是有效的
+#   （据说即使 workflow 还没被禁用，调用 enable 也会把 60 天计时器清零）。两种手段不冲突，
+#   这里额外加一层提交保活，因为「提交」是那条规则里唯一被明确确认的形式。
+#
+#   ps. 用 GITHUB_TOKEN 推送的提交不会触发其他 workflow，所以这个空提交
+#   不会顺带把 epic-free-games.yml 也跑一遍。
+#
+# 频率：每月 1 日和 16 日各打一个空提交 = 每半个月一次，相对 60 天有 4 倍余量。
+on:
+  schedule:
+    - cron: "0 0 1,16 * *"
+  workflow_dispatch:
+
+# 提交需要写权限（默认只读，不显式声明会 push 失败）
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 打一个空提交
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "chore: 保活空提交 $(date -u '+%Y-%m-%d')"
+          git push
