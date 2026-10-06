@@ -7,7 +7,13 @@ name: Epic 免费游戏提醒
 #   workflow_dispatch —— 手动点击运行，也可被外部定时器（cron-job.org 等）调用
 on:
   schedule:
+    # 平时：每周四 23:17 UTC（北京周五 07:17）——Epic 每周四 15:00 UTC 轮换
     - cron: "17 23 * * 4"
+    # 圣诞假日特卖：连续约 15 天每天送一款、每款仅 24 小时，这段改成每天跑，
+    # 否则一周只跑一次会漏掉其中 6 天。这两条触发时脚本只报告「刚上架」的游戏
+    # （见脚本里的 DAILY_CRONS / only_new），不会对挂着整周的游戏天天重复推送。
+    - cron: "17 23 * 12 *"
+    - cron: "17 23 1-8 1 *"
   workflow_dispatch:
 
 permissions:
@@ -29,6 +35,8 @@ jobs:
           FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+          # 定时触发时等于实际命中的那条 cron；手动 dispatch 时为空字符串
+          TRIGGER_SCHEDULE: ${{ github.event.schedule }}
         run: python3 scripts/epic_free_games.py
 
       - name: 保活（避免 60 天无活动被 GitHub 自动禁用定时任务）

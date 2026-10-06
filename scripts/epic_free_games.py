@@ -38,6 +38,11 @@ ID_LOGIN_ENDPOINT = "https://www.epicgames.com/id/login"
 WEB_CLIENT_ID = "875a3b57d3a640a6b7f9b4e883463ab4"
 UA = "EpicGamesLauncher/14.0.8-22004686+++Portal+Release-Live"
 
+# 圣诞假日特卖用的每日 cron：每年 12 月中旬起连续约 15 天每天送一款、每款只免费 24 小时。
+# 这两条 cron 触发时，脚本只报告「刚上架」的游戏，避免对同一款挂整周的游戏天天重复推送。
+# 必须与 .github/workflows/epic-free-games.yml 里的 cron 保持一致。
+DAILY_CRONS = ("17 23 * 12 *", "17 23 1-8 1 *")
+
 
 def http_post(url: str, data: bytes, headers: dict, timeout: int = 30):
     """返回 (http状态码, 响应正文)。"""
@@ -100,9 +105,21 @@ def classify(element: dict, now: str) -> dict:
     return {"state": "other", "window": None}
 
 
-def build_report() -> tuple:
-    """返回 (可领游戏数, 通知正文)。正文用 Markdown，飞书/Server酱/ntfy 都能渲染。"""
-    now = datetime.now(timezone.utc).isoformat()
+def _ts(value: str) -> float:
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
+
+
+def build_report(only_new: bool = False, fresh_hours: int = 25) -> tuple:
+    """返回 (可领游戏数, 通知正文)。正文用 Markdown，飞书/Server酱/ntfy 都能渲染。
+
+    only_new=True 时只报告「免费窗口在 fresh_hours 小时内才开始」的游戏。
+    假日特卖每天上架一款，靠这个过滤可以避免对同一款挂整周的游戏天天重复推送。
+    """
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
     elements = fetch_promotions()
 
     active, upcoming = [], []
@@ -113,7 +130,11 @@ def build_report() -> tuple:
         elif info["state"] == "upcoming":
             upcoming.append((element, info["window"]))
 
-    lines = ["**本周可以白领的游戏**", ""]
+    if only_new:
+        cutoff = now_dt.timestamp() - fresh_hours * 3600
+        active = [(e, w) for e, w in active if _ts(w["start"]) >= cutoff]
+
+    lines = ["**新上架的免费游戏**" if only_new else "**本周可以白领的游戏**", ""]
     if active:
         combined = checkout_link_all(
             [(e["namespace"], e["id"]) for e, _ in active]
@@ -241,16 +262,25 @@ def main() -> int:
         print(f"sign       = {feishu_sign(ts, args.test_sign)}")
         return 0
 
-    count, body = build_report()
+    # github.event.schedule 只有定时触发时才有值（等于命中的那条 cron），手动 dispatch 时为空。
+    trigger = os.environ.get("TRIGGER_SCHEDULE", "").strip()
+    only_new = trigger in DAILY_CRONS
+
+    count, body = build_report(only_new=only_new)
     title = f"Epic 免费游戏：{count} 个可领" if count else "Epic 免费游戏：本周无"
 
     print(f"标题：{title}")
+    print(f"（触发 cron：{trigger or '手动'}，only_new={only_new}）")
     print("-" * 60)
     print(body)
     print("-" * 60)
 
     if args.dry_run:
         print("（dry-run，未发送通知）")
+        return 0
+
+    if only_new and count == 0:
+        print("（假日每日轮询：没有新上架的游戏，跳过推送）")
         return 0
 
     channels = configured_channels(title, body)
