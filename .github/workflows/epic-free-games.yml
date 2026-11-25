@@ -1,51 +1,37 @@
 name: Epic 免费游戏提醒
 
-# 触发方式：
-#   schedule        —— 每周四 23:17 UTC（北京时间周五 07:17），Epic 在周四 15:00 UTC 轮换
-#                      注意：GitHub 免费账号的【私有仓库】不会触发 schedule，需改用
-#                      workflow_dispatch + 外部定时器，或把仓库设为公开。见 README。
-#   workflow_dispatch —— 手动点击运行，也可被外部定时器（cron-job.org 等）调用
 on:
   schedule:
-    # 平时：每周四 23:17 UTC（北京周五 07:17）——Epic 每周四 15:00 UTC 轮换
+    # 周四 23:17 UTC（北京时间周五 07:17）
     - cron: "17 23 * * 4"
-    # 圣诞假日特卖：连续约 15 天每天送一款、每款仅 24 小时，这段改成每天跑，
-    # 否则一周只跑一次会漏掉其中 6 天。这两条触发时脚本只报告「刚上架」的游戏
-    # （见脚本里的 DAILY_CRONS / only_new），不会对挂着整周的游戏天天重复推送。
+    # 假日每日检查，周报所在日期由周报统一推送。
     - cron: "17 23 * 12 *"
     - cron: "17 23 1-8 1 *"
   workflow_dispatch:
 
 permissions:
   contents: read
-  actions: write # 保活步骤需要，用于重置 60 天无活动计时
 
 jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
 
       - name: 检查免费游戏并推送通知
         env:
-          # 配一个即可，配几个就发几个渠道
           SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
           FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_BASE: ${{ vars.NTFY_BASE }}
           DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
-          # 定时触发时等于实际命中的那条 cron；手动 dispatch 时为空字符串
           TRIGGER_SCHEDULE: ${{ github.event.schedule }}
-        run: python3 scripts/epic_free_games.py
-
-      - name: 保活（避免 60 天无活动被 GitHub 自动禁用定时任务）
-        if: always()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          curl -sS -X PUT \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/epic-free-games.yml/enable" \
-            || echo "保活调用失败，不影响本次通知"
+        run: python scripts/epic_free_games.py

@@ -1,67 +1,173 @@
-#!/usr/bin/env python3
-"""
-Epic 免费游戏检查器（无凭据版）
-
-设计要点：**完全不持有任何 Epic 凭据**。
-依赖的促销接口是公开的，不需要登录、不需要 token，
-所以这个脚本可以安全地跑在任何云端，仓库里没有任何秘密可泄露。
-
-用法：
-    python3 epic_free_games.py --dry-run              # 只打印，不发通知
-    SERVERCHAN_KEY=xxx python3 epic_free_games.py     # 推送到微信（Server酱）
-    FEISHU_WEBHOOK=xxx python3 epic_free_games.py     # 推送到飞书群
-    NTFY_TOPIC=xxx python3 epic_free_games.py         # 推送到 ntfy
-    DINGTALK_WEBHOOK=xxx python3 epic_free_games.py   # 推送到钉钉群
-
-配了几个渠道就发几个，互不影响。
-"""
+"""读取 Epic 的免费促销，并生成可在浏览器中确认的领取链接。"""
 
 import argparse
 import base64
-import hashlib
 import hmac
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from email.header import Header
+from functools import partial
+from http.client import HTTPException
+from itertools import chain
+from typing import Literal
 
 FREE_GAMES_ENDPOINT = (
     "https://store-site-backend-static-ipv4.ak.epicgames.com/freeGamesPromotions"
 )
 PURCHASE_ENDPOINT = "https://www.epicgames.com/store/purchase"
 ID_LOGIN_ENDPOINT = "https://www.epicgames.com/id/login"
-# Epic 网页商店的公开 client id（来自 claabs/epicgames-freegames-node 的 constants.ts）
 WEB_CLIENT_ID = "875a3b57d3a640a6b7f9b4e883463ab4"
-UA = "EpicGamesLauncher/14.0.8-22004686+++Portal+Release-Live"
 
-# 圣诞假日特卖用的每日 cron：每年 12 月中旬起连续约 15 天每天送一款、每款只免费 24 小时。
-# 这两条 cron 触发时，脚本只报告「刚上架」的游戏，避免对同一款挂整周的游戏天天重复推送。
-# 必须与 .github/workflows/epic-free-games.yml 里的 cron 保持一致。
-DAILY_CRONS = ("17 23 * 12 *", "17 23 1-8 1 *")
+# 与工作流的假日 cron 和 UTC 触发时刻保持一致。
+DAILY_CRONS = {"17 23 * 12 *", "17 23 1-8 1 *"}
+SCHEDULE_TIME = timedelta(hours=23, minutes=17)
+FRESH_WINDOW = timedelta(hours=25)
+HTTP_TIMEOUT = 30
 
-
-def http_post(url: str, data: bytes, headers: dict, timeout: int = 30):
-    """返回 (http状态码, 响应正文)。"""
-    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.status, resp.read().decode("utf-8", "replace")
+type OfferId = tuple[str, str]
+type Channel = tuple[str, Callable[[], None]]
 
 
-def checkout_link(namespace: str, offer_id: str) -> str:
-    """生成 Epic 官方预填结账链接：点开后确认即可完成领取。"""
-    return checkout_link_all([(namespace, offer_id)])
+class CatalogError(Exception):
+    """促销数据读取失败。"""
 
 
-def checkout_link_all(offers: list) -> str:
-    """把多个 (namespace, offer_id) 合成一条结账链接，一次领完。"""
-    offers_param = "".join(f"&offers=1-{ns}-{oid}" for ns, oid in offers)
+class NotificationError(Exception):
+    """通知服务未确认接收。"""
+
+
+@dataclass(frozen=True, slots=True)
+class Window:
+    start: datetime
+    end: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class Game:
+    title: str
+    offer_id: OfferId
+    window: Window
+
+
+def fetch_promotions() -> list[object]:
+    query = urllib.parse.urlencode(
+        {"locale": "en-US", "country": "US", "allowCountries": "US"}
+    )
+    request = urllib.request.Request(
+        f"{FREE_GAMES_ENDPOINT}?{query}",
+        headers={"Accept": "application/json", "User-Agent": "epic-free-games"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
+            payload = json.load(response)
+    except urllib.error.HTTPError as exc:
+        exc.close()
+        raise CatalogError(f"Epic 目录返回 HTTP {exc.code}") from None
+    except (OSError, HTTPException):
+        raise CatalogError("Epic 目录连接失败") from None
+    except ValueError:
+        raise CatalogError("Epic 目录响应无法解析") from None
+
+    match payload:
+        case {
+            "data": {"Catalog": {"searchStore": {"elements": list() as elements}}}
+        } if not payload.get("errors"):
+            return elements
+        case _:
+            raise CatalogError("Epic 目录响应缺少促销列表")
+
+
+def free_windows(groups: object) -> Iterator[Window]:
+    if not isinstance(groups, list):
+        return
+    for group in groups:
+        match group:
+            case {"promotionalOffers": list() as offers}:
+                for offer in offers:
+                    if (window := parse_window(offer)) is not None:
+                        yield window
+
+
+def parse_window(offer: object) -> Window | None:
+    match offer:
+        case {
+            "startDate": str() as start,
+            "endDate": str() as end,
+            "discountSetting": {"discountPercentage": int() as percentage},
+        } if type(percentage) is int and percentage == 0:
+            try:
+                starts_at = datetime.fromisoformat(start)
+                ends_at = datetime.fromisoformat(end)
+                if (
+                    starts_at.tzinfo is not None
+                    and ends_at.tzinfo is not None
+                    and starts_at < ends_at
+                ):
+                    return Window(starts_at.astimezone(UTC), ends_at.astimezone(UTC))
+            except (ValueError, OverflowError):
+                return None
+    return None
+
+
+def classify(
+    element: object, now: datetime
+) -> tuple[Literal["active", "upcoming"], Game] | None:
+    match element:
+        case {
+            "title": str() as title,
+            "namespace": str() as namespace,
+            "id": str() as offer_id,
+            "promotions": dict() as promotions,
+        } if title.strip() and namespace and offer_id:
+            offer = namespace, offer_id
+        case _:
+            return None
+
+    current = list(free_windows(promotions.get("promotionalOffers")))
+    match element:
+        case {"price": {"totalPrice": {"discountPrice": int() as price}}} if (
+            type(price) is int and price == 0
+        ):
+            active = min(
+                (window for window in current if window.start <= now < window.end),
+                key=lambda window: (window.end, window.start),
+                default=None,
+            )
+            if active is not None:
+                return "active", Game(title, offer, active)
+
+    future = min(
+        (
+            window
+            for window in chain(
+                current, free_windows(promotions.get("upcomingPromotionalOffers"))
+            )
+            if window.start > now
+        ),
+        key=lambda window: window.start,
+        default=None,
+    )
+    if future is not None:
+        return "upcoming", Game(title, offer, future)
+    return None
+
+
+def checkout_link(offers: Iterable[OfferId]) -> str:
+    offers_query = urllib.parse.urlencode(
+        [("offers", f"1-{namespace}-{offer_id}") for namespace, offer_id in offers]
+    )
     checkout = (
-        f"{PURCHASE_ENDPOINT}?highlightColor=0078f2"
-        f"{offers_param}&orderId&purchaseToken&showNavigation=true"
+        f"{PURCHASE_ENDPOINT}?highlightColor=0078f2&{offers_query}"
+        "&orderId&purchaseToken&showNavigation=true"
     )
     query = urllib.parse.urlencode(
         {"noHostRedirect": "true", "redirectUrl": checkout, "client_id": WEB_CLIENT_ID}
@@ -69,246 +175,191 @@ def checkout_link_all(offers: list) -> str:
     return f"{ID_LOGIN_ENDPOINT}?{query}"
 
 
-def fetch_promotions() -> list:
-    url = f"{FREE_GAMES_ENDPOINT}?" + urllib.parse.urlencode(
-        {"locale": "en-US", "country": "US", "allowCountries": "US"}
-    )
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        payload = json.load(resp)
-    return payload["data"]["Catalog"]["searchStore"]["elements"]
+def markdown_title(title: str) -> str:
+    return re.sub(r"([\\\x60*_\[\]<>])", r"\\\1", " ".join(title.split()))
 
 
-def classify(element: dict, now: str) -> dict:
-    promotions = element.get("promotions") or {}
-    windows = []
-    for key in ("promotionalOffers", "upcomingPromotionalOffers"):
-        for group in promotions.get(key, []) or []:
-            for offer in group["promotionalOffers"]:
-                windows.append(
-                    {
-                        "upcoming": key.startswith("upcoming"),
-                        "start": offer["startDate"],
-                        "end": offer["endDate"],
-                        "discount": offer["discountSetting"]["discountPercentage"],
-                    }
-                )
-
-    free = [w for w in windows if w["discount"] == 0]
-    active = [w for w in free if not w["upcoming"] and w["start"] <= now <= w["end"]]
-    future = [w for w in free if w["upcoming"] or w["start"] > now]
-
-    if active:
-        return {"state": "active", "window": min(active, key=lambda w: w["end"])}
-    if future:
-        return {"state": "upcoming", "window": min(future, key=lambda w: w["start"])}
-    return {"state": "other", "window": None}
-
-
-def _ts(value: str) -> float:
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
-    except Exception:
-        return 0.0
-
-
-def build_report(only_new: bool = False, fresh_hours: int = 25) -> tuple:
-    """返回 (可领游戏数, 通知正文)。正文用 Markdown，飞书/Server酱/ntfy 都能渲染。
-
-    only_new=True 时只报告「免费窗口在 fresh_hours 小时内才开始」的游戏。
-    假日特卖每天上架一款，靠这个过滤可以避免对同一款挂整周的游戏天天重复推送。
-    """
-    now_dt = datetime.now(timezone.utc)
-    now = now_dt.isoformat()
-    elements = fetch_promotions()
-
-    active, upcoming = [], []
+def build_report(
+    elements: Iterable[object], now: datetime, *, only_new: bool
+) -> tuple[int, str]:
+    active: dict[OfferId, Game] = {}
+    upcoming: dict[OfferId, Game] = {}
+    cutoff = now - FRESH_WINDOW
     for element in elements:
-        info = classify(element, now)
-        if info["state"] == "active":
-            active.append((element, info["window"]))
-        elif info["state"] == "upcoming":
-            upcoming.append((element, info["window"]))
-
-    if only_new:
-        cutoff = now_dt.timestamp() - fresh_hours * 3600
-        active = [(e, w) for e, w in active if _ts(w["start"]) >= cutoff]
+        match classify(element, now):
+            case "active", game if not only_new or game.window.start >= cutoff:
+                active.setdefault(game.offer_id, game)
+            case "upcoming", game:
+                upcoming.setdefault(game.offer_id, game)
 
     lines = ["**新上架的免费游戏**" if only_new else "**本周可以白领的游戏**", ""]
-    if active:
-        combined = checkout_link_all(
-            [(e["namespace"], e["id"]) for e, _ in active]
+    if len(active) > 1:
+        lines.extend(
+            [f"**[打开合并结账页（{len(active)} 款）]({checkout_link(active)})**", ""]
         )
-        if len(active) > 1:
-            lines.append(f"**[一键领取全部 {len(active)} 个]({combined})**")
-            lines.append("")
-    for element, window in active:
-        link = checkout_link(element["namespace"], element["id"])
-        lines.append(f"**{element['title']}**（{window['end'][:10]} 截止）")
-        lines.append(f"[点此领取]({link})")
-        lines.append("")
+    for game in active.values():
+        lines.extend(
+            [
+                f"**{markdown_title(game.title)}**（{game.window.end:%Y-%m-%d %H:%M} UTC 截止）",
+                f"[前往 Epic 领取]({checkout_link([game.offer_id])})",
+                "",
+            ]
+        )
     if not active:
-        lines.append("此刻没有免费游戏在活动窗口内（Epic 每周四 15:00 UTC 轮换）")
+        lines.extend(["当前没有符合条件的免费促销。", ""])
 
-    if upcoming:
-        lines.append("**下周预告**")
-        for element, window in sorted(upcoming, key=lambda x: x[1]["start"]):
-            lines.append(f"- {element['title']}（{window['start'][:10]} 起）")
+    previews = sorted(upcoming.values(), key=lambda game: game.window.start)
+    if previews:
+        lines.append("**后续预告**")
+        for game in previews:
+            lines.append(
+                f"- {markdown_title(game.title)}（{game.window.start:%Y-%m-%d %H:%M} UTC 起）"
+            )
+    return len(active), "\n".join(lines).rstrip()
 
-    return len(active), "\n".join(lines)
+
+def http_post(url: str, data: bytes, headers: dict[str, str]) -> bytes:
+    try:
+        request = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
+            return response.read()
+    except urllib.error.HTTPError as exc:
+        exc.close()
+        raise NotificationError(f"HTTP {exc.code}") from None
+    except (OSError, HTTPException):
+        raise NotificationError("连接或响应读取失败") from None
+    except ValueError:
+        raise NotificationError("通知地址或请求格式无效") from None
+
+
+def post_json(url: str, payload: Mapping[str, object]) -> bytes:
+    return http_post(
+        url, json.dumps(payload).encode(), {"Content-Type": "application/json"}
+    )
+
+
+def ensure_accepted(response: bytes, *code_keys: str) -> None:
+    try:
+        payload = json.loads(response)
+    except ValueError:
+        raise NotificationError("响应无法解析") from None
+    if not isinstance(payload, dict):
+        raise NotificationError("响应缺少状态码")
+    code = next((payload[key] for key in code_keys if key in payload), None)
+    if (type(code) is int and code == 0) or code == "0":
+        return
+    if type(code) is int:
+        raise NotificationError(f"服务返回错误码 {code}")
+    raise NotificationError("响应缺少有效状态码")
 
 
 def feishu_sign(timestamp: str, secret: str) -> str:
-    """飞书自定义机器人加签：key 是 "时间戳\\n密钥"，消息体为空，输出 Base64。"""
-    string_to_sign = f"{timestamp}\n{secret}"
-    digest = hmac.new(
-        string_to_sign.encode("utf-8"), b"", digestmod=hashlib.sha256
-    ).digest()
-    return base64.b64encode(digest).decode("utf-8")
+    key = f"{timestamp}\n{secret}".encode()
+    return base64.b64encode(hmac.digest(key, b"", "sha256")).decode("ascii")
 
 
 def notify_serverchan(key: str, title: str, body: str) -> None:
-    status, text = http_post(
-        f"https://sctapi.ftqq.com/{key}.send",
+    response = http_post(
+        f"https://sctapi.ftqq.com/{urllib.parse.quote(key, safe='')}.send",
         urllib.parse.urlencode({"title": title, "desp": body}).encode(),
         {"Content-Type": "application/x-www-form-urlencoded"},
     )
-    print(f"Server酱 推送完成，HTTP {status}")
+    ensure_accepted(response, "code")
 
 
 def notify_feishu(webhook: str, title: str, body: str, secret: str = "") -> None:
-    """飞书群自定义机器人。用交互式卡片 + lark_md，保证加粗和链接正常渲染。"""
     payload = {
         "msg_type": "interactive",
         "card": {
             "header": {"title": {"tag": "plain_text", "content": title}},
-            "elements": [
-                {"tag": "div", "text": {"tag": "lark_md", "content": body}}
-            ],
+            "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": body}}],
         },
     }
     if secret:
         timestamp = str(int(time.time()))
-        payload["timestamp"] = timestamp
-        payload["sign"] = feishu_sign(timestamp, secret)
-
-    status, text = http_post(
-        webhook, json.dumps(payload).encode(), {"Content-Type": "application/json"}
-    )
-    result = json.loads(text) if text.strip().startswith("{") else {}
-    code = result.get("code", result.get("StatusCode", -1))
-    if code in (0, "0"):
-        print(f"飞书 推送完成，HTTP {status}")
-    else:
-        # 常见：签名不对(19021/19022)、关键词不匹配(19024)、webhook 失效
-        raise RuntimeError(f"飞书返回错误：{text.strip()[:200]}")
+        payload.update(timestamp=timestamp, sign=feishu_sign(timestamp, secret))
+    ensure_accepted(post_json(webhook, payload), "code", "StatusCode")
 
 
-def notify_ntfy(topic: str, title: str, body: str, base: str = "https://ntfy.sh") -> None:
-    # HTTP 头只能是 latin-1，中文标题必须按 RFC 2047 编码，否则 ntfy 会直接把 Unicode 当 latin-1 处理
-    from email.header import Header
-
-    status, _ = http_post(
-        f"{base.rstrip('/')}/{topic}",
+def notify_ntfy(topic: str, title: str, body: str, base: str) -> None:
+    http_post(
+        f"{base.rstrip('/')}/{urllib.parse.quote(topic, safe='')}",
         body.encode(),
         {"Title": Header(title, "utf-8").encode(), "Content-Type": "text/markdown"},
     )
-    print(f"ntfy 推送完成，HTTP {status}")
 
 
 def notify_dingtalk(webhook: str, title: str, body: str) -> None:
-    payload = json.dumps(
-        {"msgtype": "markdown", "markdown": {"title": title, "text": f"### {title}\n\n{body}"}}
-    ).encode()
-    status, text = http_post(webhook, payload, {"Content-Type": "application/json"})
-    result = json.loads(text) if text.strip().startswith("{") else {}
-    if result.get("errcode", 0) == 0:
-        print(f"钉钉 推送完成，HTTP {status}")
-    else:
-        raise RuntimeError(f"钉钉返回错误：{text.strip()[:200]}")
+    payload = {
+        "msgtype": "markdown",
+        "markdown": {"title": title, "text": f"### {title}\n\n{body}"},
+    }
+    ensure_accepted(post_json(webhook, payload), "errcode")
 
 
-def configured_channels(title: str, body: str) -> list:
-    """返回已配置的渠道列表 [(名称, 发送函数)]。
-
-    用默认参数绑定当前值：闭包捕获的是变量而不是值，
-    若直接写 lambda: ...v... 会让所有渠道都用上最后一次赋值的 v。
-    """
-    channels = []
-    if key := os.environ.get("SERVERCHAN_KEY"):
-        channels.append(("Server酱", lambda key=key: notify_serverchan(key, title, body)))
-    if hook := os.environ.get("FEISHU_WEBHOOK"):
-        secret = os.environ.get("FEISHU_SECRET", "")
-        channels.append(("飞书", lambda hook=hook, secret=secret: notify_feishu(hook, title, body, secret)))
-    if topic := os.environ.get("NTFY_TOPIC"):
-        base = os.environ.get("NTFY_BASE", "https://ntfy.sh")
-        channels.append(("ntfy", lambda topic=topic, base=base: notify_ntfy(topic, title, body, base)))
-    if hook := os.environ.get("DINGTALK_WEBHOOK"):
-        channels.append(("钉钉", lambda hook=hook: notify_dingtalk(hook, title, body)))
+def configured_channels(title: str, body: str) -> list[Channel]:
+    channels: list[Channel] = []
+    if key := os.getenv("SERVERCHAN_KEY"):
+        channels.append(("Server酱", partial(notify_serverchan, key, title, body)))
+    if webhook := os.getenv("FEISHU_WEBHOOK"):
+        secret = os.getenv("FEISHU_SECRET", "")
+        channels.append(("飞书", partial(notify_feishu, webhook, title, body, secret)))
+    if topic := os.getenv("NTFY_TOPIC"):
+        base = os.getenv("NTFY_BASE") or "https://ntfy.sh"
+        channels.append(("ntfy", partial(notify_ntfy, topic, title, body, base)))
+    if webhook := os.getenv("DINGTALK_WEBHOOK"):
+        channels.append(("钉钉", partial(notify_dingtalk, webhook, title, body)))
     return channels
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dry-run", action="store_true", help="只打印，不发通知")
-    parser.add_argument(
-        "--test-sign", metavar="SECRET", help="只验证飞书签名算法能否正常计算"
-    )
-    args = parser.parse_args()
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dry-run", action="store_true", help="预览通知")
+    parser.add_argument("--test-sign", metavar="SECRET", help="预览飞书签名")
+    args = parser.parse_args(argv)
 
-    if args.test_sign:
-        ts = str(int(time.time()))
-        print(f"timestamp  = {ts}")
-        print(f"sign       = {feishu_sign(ts, args.test_sign)}")
+    if args.test_sign is not None:
+        timestamp = str(int(time.time()))
+        print(f"timestamp = {timestamp}")
+        print(f"sign = {feishu_sign(timestamp, args.test_sign)}")
         return 0
 
-    # github.event.schedule 只有定时触发时才有值（等于命中的那条 cron），手动 dispatch 时为空。
-    trigger = os.environ.get("TRIGGER_SCHEDULE", "").strip()
-    only_new = trigger in DAILY_CRONS
+    now = datetime.now(UTC)
+    only_new = os.getenv("TRIGGER_SCHEDULE", "").strip() in DAILY_CRONS
+    if only_new and not args.dry_run and (now - SCHEDULE_TIME).weekday() == 3:
+        print("假日任务与周报重叠，由周报发送通知。")
+        return 0
 
-    count, body = build_report(only_new=only_new)
-    title = f"Epic 免费游戏：{count} 个可领" if count else "Epic 免费游戏：本周无"
-
-    print(f"标题：{title}")
-    print(f"（触发 cron：{trigger or '手动'}，only_new={only_new}）")
-    print("-" * 60)
-    print(body)
-    print("-" * 60)
+    try:
+        count, body = build_report(fetch_promotions(), now, only_new=only_new)
+    except CatalogError as exc:
+        print(f"读取失败：{exc}", file=sys.stderr)
+        return 2
+    title = f"Epic 免费游戏：{count} 款可领" if count else "Epic 免费游戏：当前无"
+    print(f"{title}\n\n{body}")
 
     if args.dry_run:
-        print("（dry-run，未发送通知）")
         return 0
-
     if only_new and count == 0:
-        print("（假日每日轮询：没有新上架的游戏，跳过推送）")
+        print("没有新上架的免费促销，跳过推送。")
         return 0
 
     channels = configured_channels(title, body)
     if not channels:
-        print(
-            "没有配置任何通知渠道（SERVERCHAN_KEY / FEISHU_WEBHOOK / "
-            "NTFY_TOPIC / DINGTALK_WEBHOOK）",
-            file=sys.stderr,
-        )
+        print("请至少配置一个通知渠道。", file=sys.stderr)
         return 1
 
-    sent, failed = [], []
+    exit_code = 0
     for label, send in channels:
         try:
             send()
-            sent.append(label)
-        except Exception as exc:  # 一个渠道失败不影响其他渠道
-            failed.append(label)
+        except NotificationError as exc:
             print(f"{label} 推送失败：{exc}", file=sys.stderr)
-
-    if sent:
-        print(f"已推送渠道：{', '.join(sent)}")
-    return 1 if failed else 0
+            exit_code = 1
+        else:
+            print(f"{label} 推送成功")
+    return exit_code
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except urllib.error.URLError as exc:
-        print(f"网络错误：{exc}", file=sys.stderr)
-        sys.exit(2)
+    sys.exit(main())
